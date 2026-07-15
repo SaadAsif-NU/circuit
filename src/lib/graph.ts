@@ -9,7 +9,8 @@
 
 import { z } from "zod";
 
-export type NodeKind = "input" | "llm" | "search" | "join" | "output";
+export type NodeKind =
+  "input" | "llm" | "search" | "transform" | "branch" | "join" | "output";
 
 export interface FlowNode {
   id: string;
@@ -24,8 +25,10 @@ export interface FlowNode {
 export interface FlowEdge {
   id: string;
   source: string;
-  /** The input port on the target node this edge feeds. */
+  /** The output port on the source node this edge carries away. */
+  sourcePort: string;
   target: string;
+  /** The input port on the target node this edge feeds. */
   targetPort: string;
 }
 
@@ -36,7 +39,15 @@ export interface Flow {
 
 export const flowNodeSchema = z.object({
   id: z.string().min(1),
-  kind: z.enum(["input", "llm", "search", "join", "output"]),
+  kind: z.enum([
+    "input",
+    "llm",
+    "search",
+    "transform",
+    "branch",
+    "join",
+    "output",
+  ]),
   x: z.number(),
   y: z.number(),
   config: z.record(z.string(), z.string()).default({}),
@@ -45,6 +56,9 @@ export const flowNodeSchema = z.object({
 export const flowEdgeSchema = z.object({
   id: z.string().min(1),
   source: z.string().min(1),
+  // Flows saved before nodes could have more than one output have no
+  // sourcePort, so they read back as edges from the single default port.
+  sourcePort: z.string().min(1).default("out"),
   target: z.string().min(1),
   targetPort: z.string().min(1),
 });

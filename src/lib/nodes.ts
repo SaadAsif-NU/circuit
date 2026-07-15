@@ -12,10 +12,31 @@ import type { NodeKind } from "./graph";
 /** Text flowing between nodes, keyed by the input port it arrived on. */
 export type Inputs = Record<string, string>;
 
+/**
+ * What a node produced, keyed by output port.
+ *
+ * A port left out of this record was **not taken**: nothing flows down it, and
+ * the engine skips whatever it feeds. That is the whole mechanism behind
+ * conditional routing, and it costs the engine one `undefined` check.
+ */
+export type Outputs = Record<string, string>;
+
+/** The port a block with nothing to decide sends its single value down. */
+export const OUT = "out";
+
 export interface RunContext {
   /** Emit a chunk of output as it is produced, so the UI can stream it. */
   onToken: (text: string) => void;
   signal?: AbortSignal;
+}
+
+export interface NodeField {
+  key: string;
+  label: string;
+  placeholder: string;
+  multiline?: boolean;
+  /** When set, the field is a fixed choice rather than free text. */
+  options?: string[];
 }
 
 export interface NodeDefinition {
@@ -24,20 +45,15 @@ export interface NodeDefinition {
   description: string;
   /** Named input ports. A node with none is a source. */
   inputs: string[];
-  /** Whether this node produces a value for downstream nodes. */
-  hasOutput: boolean;
+  /** Named output ports. A node with none is a sink. */
+  outputs: string[];
   /** Config fields the canvas should render an editor for. */
-  fields: Array<{
-    key: string;
-    label: string;
-    placeholder: string;
-    multiline?: boolean;
-  }>;
+  fields: NodeField[];
   run: (
     config: Record<string, string>,
     inputs: Inputs,
     ctx: RunContext,
-  ) => Promise<string>;
+  ) => Promise<Outputs>;
 }
 
 /** Fill `{{port}}` placeholders from the values arriving on the input ports. */
@@ -58,6 +74,8 @@ export const NODE_KINDS: NodeKind[] = [
   "input",
   "llm",
   "search",
+  "transform",
+  "branch",
   "join",
   "output",
 ];

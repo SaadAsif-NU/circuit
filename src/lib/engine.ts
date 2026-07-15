@@ -13,17 +13,22 @@
  *   incoming edges, and emits an event for everything that happens so a UI can
  *   animate it live. A node that throws does not take the run down: its
  *   dependants are skipped and independent branches still finish.
+ *
+ * Nodes produce a value per output port. A port that gets no value carries
+ * nothing, and its dependants are skipped exactly as if the node had failed.
+ * That one rule is all conditional routing needs: Branch simply declines to
+ * write to the port it did not take.
  */
 
 import { incoming, type Flow, type FlowNode } from "./graph";
-import { NODE_KINDS, type Inputs } from "./nodes";
+import { NODE_KINDS, type Inputs, type Outputs } from "./nodes";
 import { definitionFor } from "./registry";
 
 export type EngineEvent =
   | { type: "run.started"; nodes: number }
   | { type: "node.started"; nodeId: string }
   | { type: "node.token"; nodeId: string; text: string }
-  | { type: "node.completed"; nodeId: string; output: string; ms: number }
+  | { type: "node.completed"; nodeId: string; outputs: Outputs; ms: number }
   | { type: "node.failed"; nodeId: string; error: string }
   | { type: "node.skipped"; nodeId: string; because: string }
   | { type: "edge.active"; edgeId: string }
@@ -72,13 +77,21 @@ export function validate(flow: Flow): ValidationIssue[] {
     }
     const source = flow.nodes.find((n) => n.id === edge.source)!;
     const target = flow.nodes.find((n) => n.id === edge.target)!;
-    if (!definitionFor(source.kind)?.hasOutput) {
+    const sourceDef = definitionFor(source.kind);
+    const targetDef = definitionFor(target.kind);
+
+    if (sourceDef && sourceDef.outputs.length === 0) {
       issues.push({
         nodeId: source.id,
         message: `${source.kind} has no output to connect.`,
       });
+    } else if (sourceDef && !sourceDef.outputs.includes(edge.sourcePort)) {
+      issues.push({
+        nodeId: source.id,
+        message: `${source.kind} has no output called "${edge.sourcePort}".`,
+      });
     }
-    if (!definitionFor(target.kind)?.inputs.includes(edge.targetPort)) {
+    if (targetDef && !targetDef.inputs.includes(edge.targetPort)) {
       issues.push({
         nodeId: target.id,
         message: `${target.kind} has no input called "${edge.targetPort}".`,
@@ -95,8 +108,13 @@ export function validate(flow: Flow): ValidationIssue[] {
     seenEdge.add(key);
   }
 
-  if (findCycle(flow)) {
-    issues.push({ message: "This flow has a cycle, so it cannot run." });
+  // A cycle is the one invalid flow you can build by dragging a wire, so blame
+  // every node in the loop rather than the flow in general: the canvas marks
+  // them all, and the loop is visible instead of merely reported.
+  const cycle = findCycle(flow);
+  if (cycle) {
+    const message = "This flow has a cycle, so it cannot run.";
+    for (const id of new Set(cycle)) issues.push({ nodeId: id, message });
   }
   return issues;
 }
@@ -180,7 +198,8 @@ export function topoLevels(flow: Flow): FlowNode[][] {
 // ----------------------------------------------------------------------
 
 export interface RunResult {
-  outputs: Record<string, string>;
+  /** What each node produced, keyed by node id and then by output port. */
+  outputs: Record<string, Outputs>;
   failed: string[];
   skipped: string[];
   ok: boolean;
@@ -194,7 +213,7 @@ export async function execute(
   const started = Date.now();
   emit({ type: "run.started", nodes: flow.nodes.length });
 
-  const outputs: Record<string, string> = {};
+  const outputs: Record<string, Outputs> = {};
   const failed = new Set<string>();
   const skipped = new Set<string>();
 
@@ -203,8 +222,13 @@ export async function execute(
     await Promise.all(
       level.map(async (node) => {
         const feeds = incoming(flow, node.id);
+        // An input is unusable if its source broke, or if the source ran but
+        // sent nothing down this port (a branch that went the other way).
         const broken = feeds.find(
-          (e) => failed.has(e.source) || skipped.has(e.source),
+          (e) =>
+            failed.has(e.source) ||
+            skipped.has(e.source) ||
+            outputs[e.source]?.[e.sourcePort] === undefined,
         );
         if (broken) {
           skipped.add(node.id);
@@ -218,7 +242,8 @@ export async function execute(
 
         const inputs: Inputs = {};
         for (const edge of feeds) {
-          inputs[edge.targetPort] = outputs[edge.source] ?? "";
+          inputs[edge.targetPort] =
+            outputs[edge.source]?.[edge.sourcePort] ?? "";
           emit({ type: "edge.active", edgeId: edge.id });
         }
 
@@ -227,16 +252,16 @@ export async function execute(
         try {
           const definition = definitionFor(node.kind);
           if (!definition) throw new Error(`Unknown node kind "${node.kind}".`);
-          const output = await definition.run(node.config ?? {}, inputs, {
+          const produced = await definition.run(node.config ?? {}, inputs, {
             onToken: (text) =>
               emit({ type: "node.token", nodeId: node.id, text }),
             signal,
           });
-          outputs[node.id] = output;
+          outputs[node.id] = produced;
           emit({
             type: "node.completed",
             nodeId: node.id,
-            output,
+            outputs: produced,
             ms: Date.now() - at,
           });
         } catch (error) {
