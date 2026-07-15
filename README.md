@@ -28,6 +28,12 @@ tested). A flow is a directed acyclic graph, so running one means:
   emit an event for everything that happens. A node that throws does not take
   the run down; its dependants are skipped and independent branches still finish.
 
+A node produces a value **per output port**, and that one detail is what lets a
+flow branch. A port left out of a node's result carries nothing, so its
+dependants are skipped by the same code that already handled a failed node.
+Branch does not need the engine's help: it declines to write to the port it did
+not take, and the whole chain behind that port goes quiet.
+
 **2. A node editor**, with no react-flow or xyflow. HTML nodes (so they can hold
 live text fields and streamed output) over an SVG wire layer, both under one
 pan/zoom transform. Ports are anchored to fixed offsets rather than measured, so
@@ -53,20 +59,37 @@ reads the response body and parses the SSE frames itself.)
 
 ## The blocks
 
-| Block      | Inputs          | What it does                                                                        |
-| :--------- | :-------------- | :---------------------------------------------------------------------------------- |
-| **Input**  | —               | The text the flow starts from.                                                      |
-| **Model**  | `in`, `context` | Prompts Gemini and streams the reply. `{{in}}` drops in what arrived.               |
-| **Search** | `in`            | Retrieves passages from a small built-in knowledge base, so a flow can be grounded. |
-| **Join**   | `a`, `b`        | Merges two branches with a template.                                                |
-| **Output** | `in`            | Where the flow ends up.                                                             |
+| Block      | Inputs          | Outputs         | What it does                                                                        |
+| :--------- | :-------------- | :-------------- | :---------------------------------------------------------------------------------- |
+| **Input**  | —               | `out`           | The text the flow starts from.                                                      |
+| **Model**  | `in`, `context` | `out`           | Prompts Gemini and streams the reply. `{{in}}` drops in what arrived.               |
+| **Search** | `in`            | `out`           | Retrieves passages from a small built-in knowledge base, so a flow can be grounded. |
+| **Text**   | `in`            | `out`           | Reshapes text without a model: trim, first line, extract JSON, and so on.           |
+| **Branch** | `in`            | `true`, `false` | Sends the text down one path. The other path is skipped.                            |
+| **Join**   | `a`, `b`        | `out`           | Merges two branches with a template.                                                |
+| **Output** | `in`            | —               | Where the flow ends up.                                                             |
 
 Blocks are data, not branching: a node declares its ports and a runner, and the
 validator, the canvas, and the engine all pick it up.
 
-The flow the canvas opens with is a **diamond** on purpose: one input fans out to
-a search and a model that run at the same time, then fans back into a second
-model that uses both. You can watch both middle nodes light up together.
+## Two flows to open
+
+The **Grounded answer** flow is a diamond on purpose: one input fans out to a
+search and a model that run at the same time, then fans back into a second model
+that uses both. You can watch both middle nodes light up together.
+
+The **Support router** flow shows the opposite. It classifies a message, cleans
+the model's answer down to one word, and routes on it. Only one of the two
+replies runs:
+
+![A branch mid-run: the true path is live, the false path is already skipped](docs/branch-running.png)
+
+Watch the Branch: the port it took goes green, the port it did not goes dim, and
+everything behind that port greys out and reports `skipped`. Both replies read
+the original message off the Input node's second wire, because what reaches them
+through the branch is the verdict, not the complaint.
+
+![The finished branch: one path green, the other grey](docs/branch-done.png)
 
 ## Run it
 
@@ -83,8 +106,12 @@ Open [http://localhost:3000](http://localhost:3000) and press **Run**.
 
 - Drag a node by its **header**, drag from a node's **right port** to another
   node's **left port** to wire them, **click a wire** to cut it.
-- **Scroll** to zoom, drag the background to pan.
-- Add blocks from the palette; delete one with the **x** on its header.
+- **Scroll** to zoom, drag the background to pan, or hit **fit** to frame
+  everything.
+- Add blocks from the palette. Click a node to select it and press **Delete**, or
+  use the **x** on its header.
+- **Flow** opens a preset, or moves a flow in and out as JSON. Whatever is on the
+  canvas is kept in the browser, so a reload picks up where you left off.
 
 ### Optional: use a real model
 
@@ -112,21 +139,23 @@ src/
   lib/
     graph.ts      # Flow, FlowNode, FlowEdge, Zod schema
     nodes.ts      # the NodeDefinition contract + templating
-    registry.ts   # the blocks: input, llm, search, join, output
+    registry.ts   # the blocks: input, llm, search, transform, branch, join, output
+    text.ts       # the deterministic logic behind Text and Branch
     engine.ts     # validate -> topoLevels -> execute, emitting events
     llm.ts        # streamed Gemini, with an offline stand-in
     search.ts     # the built-in knowledge base
-    layout.ts     # port geometry, bezier wires, the pan/zoom transform
+    layout.ts     # port geometry, bezier wires, the pan/zoom transform, fit
+    storage.ts    # serialise, validate on the way back in, localStorage, files
     useRun.ts     # posts the flow, folds the SSE stream into render state
-    presets.ts    # the starter flow
+    presets.ts    # the flows the toolbar can open
   app/
     api/run/route.ts   # POST a flow -> SSE of engine events
     page.tsx
   components/
-    Canvas.tsx    # pan, zoom, drag, connect
+    Canvas.tsx    # pan, zoom, drag, connect, select
     NodeCard.tsx  # one block: ports, fields, streamed output
     Wire.tsx      # a bezier connection, marching when live
-    Toolbar.tsx   # palette, run/stop, validation
+    Toolbar.tsx   # palette, presets, import/export, run/stop, validation
 ```
 
 ## Scripts
@@ -144,9 +173,17 @@ npm run lint         # eslint
 The engine and the canvas maths are the parts that must be right, so they are
 tested directly: validation (every rejection above), cycle detection, that a
 topological wave never precedes its dependency, that values thread along edges
-and fan in, that a failure skips its dependants while independent branches still
-run, plus port geometry, bezier clamping, and that zooming keeps the point under
-the cursor fixed.
+and fan in, and that a failure skips its dependants while independent branches
+still run.
+
+Branching gets its own set, since it is the subtle one: that the untaken wire
+never carries data, that a whole chain behind it is skipped rather than just the
+next node, and that a branch whose condition is nonsense fails itself instead of
+the run.
+
+The rest covers port geometry, bezier clamping, that zooming keeps the point
+under the cursor fixed, that fitting puts every node on screen, and that a saved
+flow round trips while a file that is not one is rejected outright.
 
 ```bash
 npm test
