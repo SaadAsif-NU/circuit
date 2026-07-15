@@ -1,11 +1,21 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { GitMerge, Search, Sparkles, Terminal, Type, X } from "lucide-react";
+import {
+  AlertTriangle,
+  GitMerge,
+  Search,
+  Sparkles,
+  Split,
+  Terminal,
+  Type,
+  WrapText,
+  X,
+} from "lucide-react";
 
 import { cn } from "@/lib/cn";
 import type { FlowNode, NodeKind } from "@/lib/graph";
-import { NODE_W, PORT_GAP, PORT_TOP } from "@/lib/layout";
+import { NODE_W, PORT_GAP, PORT_TOP, portRows } from "@/lib/layout";
 import type { NodeDefinition } from "@/lib/nodes";
 import type { NodeStatus } from "@/lib/useRun";
 
@@ -13,6 +23,8 @@ const ICONS: Record<NodeKind, typeof Type> = {
   input: Type,
   llm: Sparkles,
   search: Search,
+  transform: WrapText,
+  branch: Split,
   join: GitMerge,
   output: Terminal,
 };
@@ -25,12 +37,18 @@ const STATUS_RING: Record<NodeStatus, string> = {
   skipped: "border-line opacity-50",
 };
 
+const PORT_DOT =
+  "absolute h-3.5 w-3.5 rounded-full border-2 bg-node transition hover:border-accent hover:bg-accent/30";
+
 export function NodeCard({
   node,
   def,
   status,
   text,
+  taken,
   selected,
+  issue,
+  onSelect,
   onPointerDownHeader,
   onConfigChange,
   onOutputDown,
@@ -41,14 +59,19 @@ export function NodeCard({
   def: NodeDefinition;
   status: NodeStatus;
   text: string;
+  /** Output ports that carried a value on the last run, if it has finished. */
+  taken?: string[];
   selected: boolean;
+  issue?: string;
+  onSelect: () => void;
   onPointerDownHeader: (e: React.PointerEvent) => void;
   onConfigChange: (key: string, value: string) => void;
-  onOutputDown: (e: React.PointerEvent) => void;
+  onOutputDown: (port: string, e: React.PointerEvent) => void;
   onInputUp: (port: string) => void;
   onDelete: () => void;
 }) {
   const Icon = ICONS[node.kind];
+  const rows = portRows(def.inputs.length, def.outputs.length);
 
   return (
     <motion.div
@@ -56,10 +79,12 @@ export function NodeCard({
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9 }}
       transition={{ type: "spring", stiffness: 320, damping: 26 }}
+      onPointerDown={onSelect}
       className={cn(
         "glass group absolute rounded-xl border transition-colors",
         STATUS_RING[status],
-        selected && "border-primary/70",
+        issue && "border-fail/70",
+        selected && "border-primary/70 ring-2 ring-primary/30",
       )}
       style={{ left: node.x, top: node.y, width: NODE_W }}
     >
@@ -72,6 +97,12 @@ export function NodeCard({
           <Icon className="h-3.5 w-3.5" />
         </span>
         <span className="flex-1 truncate text-sm font-medium">{def.label}</span>
+        {issue && (
+          <span title={issue} className="text-fail">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            <span className="sr-only">{issue}</span>
+          </span>
+        )}
         {status === "running" && (
           <span className="text-[10px] text-live">running</span>
         )}
@@ -94,45 +125,86 @@ export function NodeCard({
         </button>
       </div>
 
-      {/* One row per input. The rows reserve the vertical space the ports sit
-          in, so a wire never lands on top of a text field. */}
-      {def.inputs.map((port, i) => (
-        <div
-          key={port}
-          className="flex items-center px-3"
-          style={{ height: PORT_GAP }}
-        >
-          <span className="pointer-events-none text-[10px] text-muted">
-            {port}
-          </span>
-          <button
-            onPointerUp={() => onInputUp(port)}
-            aria-label={`Input ${port}`}
-            className="absolute h-3.5 w-3.5 rounded-full border-2 border-wire bg-node transition hover:border-accent hover:bg-accent/30"
-            style={{ left: -7, top: PORT_TOP + i * PORT_GAP - 7 }}
-          />
-        </div>
-      ))}
+      {/* One row per port pair: inputs down the left, outputs down the right.
+          The rows reserve the vertical space the port dots sit in, which is what
+          stops a wire from landing on top of a text field. */}
+      {Array.from({ length: rows }, (_, i) => {
+        const inPort = def.inputs[i];
+        const outPort = def.outputs[i];
+        const wasTaken = taken?.includes(outPort ?? "");
+        const wasSkipped = taken !== undefined && outPort && !wasTaken;
+        return (
+          <div
+            key={i}
+            className="flex items-center justify-between px-3"
+            style={{ height: PORT_GAP }}
+          >
+            <span className="pointer-events-none text-[10px] text-muted">
+              {inPort ?? ""}
+            </span>
+            {inPort && (
+              <button
+                onPointerUp={() => onInputUp(inPort)}
+                aria-label={`Input ${inPort}`}
+                className={cn(PORT_DOT, "border-wire")}
+                style={{ left: -7, top: PORT_TOP + i * PORT_GAP - 7 }}
+              />
+            )}
 
-      {/* output port */}
-      {def.hasOutput && (
-        <button
-          onPointerDown={onOutputDown}
-          aria-label="Output"
-          className="absolute h-3.5 w-3.5 cursor-crosshair rounded-full border-2 border-wire bg-node transition hover:border-accent hover:bg-accent/30"
-          style={{ left: NODE_W - 7, top: PORT_TOP - 7 }}
-        />
-      )}
+            <span
+              className={cn(
+                "pointer-events-none text-[10px]",
+                wasTaken
+                  ? "text-done"
+                  : wasSkipped
+                    ? "text-muted/40"
+                    : "text-muted",
+              )}
+            >
+              {outPort ?? ""}
+            </span>
+            {outPort && (
+              <button
+                onPointerDown={(e) => onOutputDown(outPort, e)}
+                aria-label={`Output ${outPort}`}
+                className={cn(
+                  PORT_DOT,
+                  "cursor-crosshair",
+                  wasTaken ? "border-done" : "border-wire",
+                  wasSkipped && "opacity-40",
+                )}
+                style={{ left: NODE_W - 7, top: PORT_TOP + i * PORT_GAP - 7 }}
+              />
+            )}
+          </div>
+        );
+      })}
 
       <div className="space-y-2 px-3 pb-3 pt-2">
         {def.fields.map((field) =>
-          field.multiline ? (
+          field.options ? (
+            <select
+              key={field.key}
+              value={node.config[field.key] || field.options[0]}
+              onChange={(e) => onConfigChange(field.key, e.target.value)}
+              onPointerDown={(e) => e.stopPropagation()}
+              aria-label={field.label}
+              className="w-full rounded-md border border-line bg-base/60 px-2 py-1.5 font-mono text-[11px] text-text outline-none focus:border-primary/60"
+            >
+              {field.options.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          ) : field.multiline ? (
             <textarea
               key={field.key}
               value={node.config[field.key] ?? ""}
               onChange={(e) => onConfigChange(field.key, e.target.value)}
               onPointerDown={(e) => e.stopPropagation()}
               placeholder={field.placeholder}
+              aria-label={field.label}
               rows={3}
               className="w-full resize-none rounded-md border border-line bg-base/60 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-text outline-none placeholder:text-muted/60 focus:border-primary/60"
             />
@@ -143,6 +215,7 @@ export function NodeCard({
               onChange={(e) => onConfigChange(field.key, e.target.value)}
               onPointerDown={(e) => e.stopPropagation()}
               placeholder={field.placeholder}
+              aria-label={field.label}
               className="w-full rounded-md border border-line bg-base/60 px-2 py-1.5 font-mono text-[11px] text-text outline-none placeholder:text-muted/60 focus:border-primary/60"
             />
           ),

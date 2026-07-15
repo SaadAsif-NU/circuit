@@ -1,7 +1,7 @@
 "use client";
 
 import { AnimatePresence, MotionConfig } from "framer-motion";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { NodeCard } from "@/components/NodeCard";
 import { Toolbar } from "@/components/Toolbar";
@@ -9,14 +9,16 @@ import { GhostWire, Wire } from "@/components/Wire";
 import { validate } from "@/lib/engine";
 import type { Flow, FlowNode, NodeKind } from "@/lib/graph";
 import {
+  fitView,
   inputPortPos,
   outputPortPos,
   toGraph,
   zoomAbout,
   type Point,
 } from "@/lib/layout";
-import { starterFlow } from "@/lib/presets";
+import { starterFlow, type Preset } from "@/lib/presets";
 import { definitionFor } from "@/lib/registry";
+import { deserialize, exportFile, load, save } from "@/lib/storage";
 import { useRun } from "@/lib/useRun";
 
 /** What the user is currently doing with the pointer. */
@@ -24,21 +26,37 @@ type Drag =
   | { kind: "none" }
   | { kind: "pan"; startPan: Point; startScreen: Point }
   | { kind: "node"; nodeId: string; offset: Point }
-  | { kind: "wire"; from: string; cursor: Point };
+  | { kind: "wire"; from: string; fromPort: string; cursor: Point };
 
 let seq = 0;
 const nextId = (kind: string) => `${kind}-${Date.now().toString(36)}-${seq++}`;
 
+/** The canvas fills the window, so this is the surface it has to fit into. */
+const viewport = () => ({
+  width: window.innerWidth,
+  height: window.innerHeight,
+});
+
 export function Canvas() {
-  const [flow, setFlow] = useState<Flow>(starterFlow);
-  const [pan, setPan] = useState<Point>({ x: 40, y: 40 });
-  const [zoom, setZoom] = useState(0.85);
+  // Only ever mounted in the browser (see app/page.tsx), so both the last flow
+  // and the view that frames it can be settled before the first paint rather
+  // than swapped in after it.
+  const [flow, setFlow] = useState<Flow>(() => load() ?? starterFlow());
+  const [view, setView] = useState(() => fitView(flow.nodes, viewport()));
+  const { pan, zoom } = view;
   const [drag, setDrag] = useState<Drag>({ kind: "none" });
   const [selected, setSelected] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const surface = useRef<HTMLDivElement>(null);
   const run = useRun();
 
   const issues = validate(flow);
+  const issueFor = new Map<string, string>();
+  for (const issue of issues) {
+    if (issue.nodeId && !issueFor.has(issue.nodeId)) {
+      issueFor.set(issue.nodeId, issue.message);
+    }
+  }
 
   const screenOf = useCallback(
     (e: { clientX: number; clientY: number }): Point => {
@@ -51,6 +69,14 @@ export function Canvas() {
     [],
   );
 
+  // -- the flow survives a reload ---------------------------------------
+
+  // Debounced, because dragging a node rewrites the flow on every pointer move.
+  useEffect(() => {
+    const timer = setTimeout(() => save(flow), 400);
+    return () => clearTimeout(timer);
+  }, [flow]);
+
   // -- pointer plumbing ------------------------------------------------
 
   const onPointerMove = useCallback(
@@ -58,10 +84,13 @@ export function Canvas() {
       if (drag.kind === "none") return;
       const screen = screenOf(e);
       if (drag.kind === "pan") {
-        setPan({
-          x: drag.startPan.x + (screen.x - drag.startScreen.x),
-          y: drag.startPan.y + (screen.y - drag.startScreen.y),
-        });
+        setView((v) => ({
+          ...v,
+          pan: {
+            x: drag.startPan.x + (screen.x - drag.startScreen.x),
+            y: drag.startPan.y + (screen.y - drag.startScreen.y),
+          },
+        }));
       } else if (drag.kind === "node") {
         const g = toGraph(screen, pan, zoom);
         setFlow((f) => ({
@@ -83,11 +112,14 @@ export function Canvas() {
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
-      const next = zoomAbout(screenOf(e), pan, zoom, e.deltaY < 0 ? 1.1 : 0.9);
-      setPan(next.pan);
-      setZoom(next.zoom);
+      setView(zoomAbout(screenOf(e), pan, zoom, e.deltaY < 0 ? 1.1 : 0.9));
     },
     [pan, zoom, screenOf],
+  );
+
+  const fit = useCallback(
+    (nodes: FlowNode[] = flow.nodes) => setView(fitView(nodes, viewport())),
+    [flow.nodes],
   );
 
   // -- graph edits -----------------------------------------------------
@@ -95,7 +127,7 @@ export function Canvas() {
   const connect = useCallback(
     (target: string, port: string) => {
       if (drag.kind !== "wire") return;
-      const source = drag.from;
+      const { from: source, fromPort } = drag;
       setDrag({ kind: "none" });
       if (source === target) return;
       setFlow((f) => ({
@@ -105,7 +137,13 @@ export function Canvas() {
           ...f.edges.filter(
             (e) => !(e.target === target && e.targetPort === port),
           ),
-          { id: nextId("e"), source, target, targetPort: port },
+          {
+            id: nextId("e"),
+            source,
+            sourcePort: fromPort,
+            target,
+            targetPort: port,
+          },
         ],
       }));
     },
@@ -135,6 +173,55 @@ export function Canvas() {
     }));
   }, []);
 
+  // Delete removes the selected node; Escape lets it go. Ignored while a text
+  // field has focus, where Backspace obviously means backspace.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.key === "Escape") {
+        setSelected(null);
+        setDrag({ kind: "none" });
+      } else if ((e.key === "Delete" || e.key === "Backspace") && selected) {
+        e.preventDefault();
+        deleteNode(selected);
+        setSelected(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, deleteNode]);
+
+  // -- flows in and out --------------------------------------------------
+
+  const openFlow = useCallback(
+    (next: Flow) => {
+      run.reset();
+      setFlow(next);
+      setSelected(null);
+      setNotice(null);
+      fit(next.nodes);
+    },
+    [run, fit],
+  );
+
+  const openPreset = useCallback(
+    (preset: Preset) => openFlow(preset.build()),
+    [openFlow],
+  );
+
+  const importFlow = useCallback(
+    async (file: File) => {
+      const next = deserialize(await file.text());
+      if (!next) {
+        setNotice("That file is not a circuit flow.");
+        return;
+      }
+      openFlow(next);
+    },
+    [openFlow],
+  );
+
   const nodeById = useCallback(
     (id: string) => flow.nodes.find((n) => n.id === id),
     [flow.nodes],
@@ -147,14 +234,12 @@ export function Canvas() {
           onAdd={addNode}
           onRun={() => run.run(flow)}
           onStop={run.stop}
-          onReset={() => {
-            run.reset();
-            setFlow(starterFlow());
-            setPan({ x: 40, y: 40 });
-            setZoom(0.85);
-          }}
+          onPreset={openPreset}
+          onImport={importFlow}
+          onExport={() => exportFile(flow)}
+          onFit={() => fit()}
           running={run.running}
-          issue={issues[0]?.message ?? run.error}
+          issue={notice ?? issues[0]?.message ?? run.error}
           ms={run.ms}
         />
 
@@ -187,16 +272,21 @@ export function Canvas() {
                 const from = nodeById(edge.source);
                 const to = nodeById(edge.target);
                 if (!from || !to) return null;
-                const def = definitionFor(to.kind);
-                const index = Math.max(
+                const fromDef = definitionFor(from.kind);
+                const toDef = definitionFor(to.kind);
+                const out = Math.max(
                   0,
-                  def?.inputs.indexOf(edge.targetPort) ?? 0,
+                  fromDef?.outputs.indexOf(edge.sourcePort) ?? 0,
+                );
+                const into = Math.max(
+                  0,
+                  toDef?.inputs.indexOf(edge.targetPort) ?? 0,
                 );
                 return (
                   <g key={edge.id} className="pointer-events-auto">
                     <Wire
-                      from={outputPortPos(from)}
-                      to={inputPortPos(to, index)}
+                      from={outputPortPos(from, out)}
+                      to={inputPortPos(to, into)}
                       active={run.running && run.activeEdges.has(edge.id)}
                       done={!run.running && run.activeEdges.has(edge.id)}
                       onCut={() =>
@@ -212,9 +302,18 @@ export function Canvas() {
               {drag.kind === "wire" &&
                 (() => {
                   const from = nodeById(drag.from);
-                  return from ? (
-                    <GhostWire from={outputPortPos(from)} to={drag.cursor} />
-                  ) : null;
+                  if (!from) return null;
+                  const index = Math.max(
+                    0,
+                    definitionFor(from.kind)?.outputs.indexOf(drag.fromPort) ??
+                      0,
+                  );
+                  return (
+                    <GhostWire
+                      from={outputPortPos(from, index)}
+                      to={drag.cursor}
+                    />
+                  );
                 })()}
             </g>
           </svg>
@@ -237,7 +336,10 @@ export function Canvas() {
                     def={def}
                     status={run.status[node.id] ?? "idle"}
                     text={run.text[node.id] ?? ""}
+                    taken={run.taken[node.id]}
                     selected={selected === node.id}
+                    issue={issueFor.get(node.id)}
+                    onSelect={() => setSelected(node.id)}
                     onPointerDownHeader={(e) => {
                       e.stopPropagation();
                       setSelected(node.id);
@@ -258,11 +360,12 @@ export function Canvas() {
                         ),
                       }))
                     }
-                    onOutputDown={(e) => {
+                    onOutputDown={(port, e) => {
                       e.stopPropagation();
                       setDrag({
                         kind: "wire",
                         from: node.id,
+                        fromPort: port,
                         cursor: toGraph(screenOf(e), pan, zoom),
                       });
                     }}

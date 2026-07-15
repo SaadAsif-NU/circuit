@@ -11,6 +11,8 @@ export interface RunState {
   status: Record<string, NodeStatus>;
   /** Text streamed out of each node so far. */
   text: Record<string, string>;
+  /** Output ports that carried a value, so a branch can show the path it took. */
+  taken: Record<string, string[]>;
   activeEdges: Set<string>;
   running: boolean;
   error: string | null;
@@ -20,6 +22,7 @@ export interface RunState {
 const EMPTY: RunState = {
   status: {},
   text: {},
+  taken: {},
   activeEdges: new Set(),
   running: false,
   error: null,
@@ -59,10 +62,12 @@ export function useRun() {
             },
           };
         case "node.completed":
+          // The streamed tokens already are the text, so this only records the
+          // status and which output ports actually carried a value.
           return {
             ...s,
             status: { ...s.status, [event.nodeId]: "done" },
-            text: { ...s.text, [event.nodeId]: event.output },
+            taken: { ...s.taken, [event.nodeId]: Object.keys(event.outputs) },
           };
         case "node.failed":
           return {
