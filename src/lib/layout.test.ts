@@ -4,10 +4,13 @@ import type { FlowNode } from "./graph";
 import {
   bezierPath,
   clampZoom,
+  fitView,
   inputPortPos,
   NODE_W,
   outputPortPos,
+  PORT_GAP,
   PORT_TOP,
+  portRows,
   toGraph,
   toScreen,
   zoomAbout,
@@ -22,8 +25,22 @@ describe("ports", () => {
     expect(inputPortPos(node, 1).x).toBe(100);
   });
 
-  it("puts the output on the right edge", () => {
+  it("puts outputs on the right edge, spaced down the same way", () => {
     expect(outputPortPos(node)).toEqual({ x: 100 + NODE_W, y: 200 + PORT_TOP });
+    expect(outputPortPos(node, 1)).toEqual({
+      x: 100 + NODE_W,
+      y: 200 + PORT_TOP + PORT_GAP,
+    });
+  });
+
+  it("lines an output up with the input on the same row", () => {
+    expect(outputPortPos(node, 1).y).toBe(inputPortPos(node, 1).y);
+  });
+
+  it("reserves a row for every port on the busier side", () => {
+    expect(portRows(2, 1)).toBe(2); // a Model: in, context -> out
+    expect(portRows(1, 2)).toBe(2); // a Branch: in -> true, false
+    expect(portRows(0, 1)).toBe(1); // an Input: nothing -> out
   });
 });
 
@@ -76,5 +93,52 @@ describe("zoomAbout", () => {
   it("respects the zoom limits", () => {
     const r = zoomAbout({ x: 0, y: 0 }, { x: 0, y: 0 }, 2, 10);
     expect(r.zoom).toBe(2);
+  });
+});
+
+describe("fitView", () => {
+  const viewport = { width: 1200, height: 800 };
+  const spread: FlowNode[] = [
+    { id: "a", kind: "input", x: 0, y: 0, config: {} },
+    { id: "b", kind: "output", x: 2000, y: 900, config: {} },
+  ];
+
+  it("zooms out far enough to hold a wide flow", () => {
+    const { zoom } = fitView(spread, viewport);
+    expect(zoom).toBeLessThan(1);
+    // Every node lands inside the viewport.
+    const view = fitView(spread, viewport);
+    for (const n of spread) {
+      const p = toScreen({ x: n.x, y: n.y }, view.pan, view.zoom);
+      expect(p.x).toBeGreaterThanOrEqual(0);
+      expect(p.y).toBeGreaterThanOrEqual(0);
+      expect(p.x).toBeLessThanOrEqual(viewport.width);
+      expect(p.y).toBeLessThanOrEqual(viewport.height);
+    }
+  });
+
+  it("centres the flow", () => {
+    const view = fitView(spread, viewport);
+    const left = toScreen({ x: 0, y: 0 }, view.pan, view.zoom);
+    const right = toScreen({ x: 2000 + NODE_W, y: 0 }, view.pan, view.zoom);
+    expect(left.x).toBeCloseTo(viewport.width - right.x, 6);
+  });
+
+  it("does not blow a small flow up past its natural size", () => {
+    const one: FlowNode[] = [
+      { id: "a", kind: "input", x: 0, y: 0, config: {} },
+    ];
+    expect(fitView(one, viewport).zoom).toBe(1);
+  });
+
+  it("falls back to the default view when there is nothing to fit", () => {
+    expect(fitView([], viewport)).toEqual({
+      pan: { x: 40, y: 40 },
+      zoom: 0.85,
+    });
+    expect(fitView(spread, { width: 0, height: 0 })).toEqual({
+      pan: { x: 40, y: 40 },
+      zoom: 0.85,
+    });
   });
 });
